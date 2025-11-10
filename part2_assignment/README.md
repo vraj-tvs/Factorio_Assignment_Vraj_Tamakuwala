@@ -21,7 +21,9 @@ The factory steady-state problem is formulated as a **Linear Program (LP)** usin
 
 **Conservation Law**: For each item `i`, the net production must match requirements:
 
-$$\sum_{r} [out\_r[i] * (1 + prod\_m) * x\_r] - \sum_{r} [in\_r[i] * x\_r] = b[i]$$
+```
+Σ_r [out_r[i] × (1 + prod_m) × x_r] - Σ_r [in_r[i] × x_r] = b[i]
+```
 
 Where:
 
@@ -61,6 +63,7 @@ Raw materials have two constraints:
    - Total consumption cannot exceed available supply
    - Implemented as: `-net_production[i] ≤ supply_cap[i]`
 
+
 #### Machine Capacity Constraints
 
 For each machine type `m`:
@@ -81,142 +84,131 @@ Modules (speed and productivity bonuses) apply uniformly to all recipes using th
 
 Affects how fast recipes complete:
 
-$$eff\_crafts\_per\_min(r) = \frac{base\_speed * (1 + speed\_mult) * 60}{time\_s}$$
+```python
+eff_crafts_per_min(r) = base_speed × (1 + speed_mult) × 60 / time_s
+```
 
-**Example**:
-
-- Base speed: `30 crafts/min`
-- Speed module: `+15\% (speed_mult = 0.15)`
-- Recipe time: `0.5s`
+**Example**: 
+- Base speed: 30 crafts/min
+- Speed module: +15% (speed_mult = 0.15)
+- Recipe time: 0.5s
 - Result: `30 × 1.15 × 60 / 0.5 = 4140 crafts/min per machine`
 
 #### Productivity Multiplier
 
 Affects only outputs (not inputs):
 
-$$effective\_output[i] = base\_output[i] * (1 + prod\_mult)$$
+```python
+effective_output[i] = base_output[i] × (1 + prod_mult)
+```
 
 **Example**:
-
 - Base output: 1 green_circuit per craft
-- Productivity module: +10% (```prod_mult``` = 0.1)
+- Productivity module: +10% (prod_mult = 0.1)
 - Effective output: 1.1 green_circuits per craft
 
 **Key Insight**: Productivity reduces crafts needed:
-
 - To produce 1800 items/min with 1.1× productivity
 - Requires only 1800/1.1 = 1636.36 crafts/min
 
-### Handling Cycles, Byproducts, and Self-Contained Recipes
+---
 
-#### Cyclic Recipes
+## Factory — Modeling choices
 
-**Example**: catalyst_a ↔ catalyst_b cycle
+- Item balances / conservation equations
 
-- Recipe 1: `catalyst_a` + petroleum → `catalyst_b` + product
-- Recipe 2: `catalyst_b` → `catalyst_a` + waste
+  - For each item i: Σ_r [effective_out_r[i] × x_r] - Σ_r [in_r[i] × x_r] = b[i]
+  - Classification: target (b[target]=target_rate), intermediates (b=0), byproducts (b≥0), raw materials (b≤0 and bounded by supply cap).
 
-The conservation equations naturally handle cycles by enforcing balance for cyclic intermediates:
+- Raw consumption and machine capacity
 
-```
-For catalyst_a: production_a - consumption_a = 0
-For catalyst_b: production_b - consumption_b = 0
-```
+  - Raw items: net_production ≤ 0 and -net_production ≤ supply_cap.
+  - Machine capacity per type m: Σ\_{r uses m} (x_r / eff_crafts_per_min[r]) ≤ max_machines[m].
 
-The LP solver finds steady-state flow rates (e.g., both at 20 crafts/min) where catalysts circulate without accumulation, while the system produces the desired product.
+- Module application (per-machine-type)
 
-**Key Insight**: Setting `b[i] = 0` for cyclic intermediates allows the solver to determine the optimal cycle flow rate automatically.
+  - Speed modules scale craft rate: eff_crafts_per_min = base_speed × (1+speed_mult) × 60 / time_s.
+  - Productivity modules scale outputs only: effective_output = base_output × (1+prod_mult).
 
-#### Byproducts
+- Handling cycles, byproducts, self-contained recipes
 
-**Example**: Recipe produces both wanted item X and unwanted byproduct Y that is never consumed
+  - Cyclic intermediates: set b[i]=0; conservation enforces steady-state circulation automatically.
+  - Byproducts (produced but never consumed): allow net_production ≥ 0 so surplus accumulates; report byproduct_surplus_per_min.
+  - Self-contained recipes (consume and produce same items): treated as cyclic/intermediate — LP chooses a non-zero rate only if beneficial.
 
-**Implementation**: Byproducts use inequality constraints:
+- Tie-breaking and objective
 
-```python
-if item in byproduct_items:
-    prob += net_production >= 0  # Allow accumulation
-```
+  - Primary objective: meet target exactly. Secondary: minimize total machines used via objective minimize Σ_r (x_r / eff_crafts_per_min[r]).
+  - Determinism: sort recipes/items lexicographically when building constraints; fix solver seed and run single-threaded.
 
-This permits the recipe to run even though Y accumulates, as long as:
+- Infeasibility detection & reporting
+  - Use LP's infeasibility detection (CBC Simplex Phase I). If infeasible, binary search target in [0, target] to find max feasible rate (precision via fixed iterations). Report max_feasible_target_per_min and conservative bottleneck hints (machine caps / raw supplies near limits).
 
-- The byproduct doesn't violate any constraints
-- The recipe is needed to produce other items
+--- 
 
-# Design summary (concise)
+## Belts — Modeling choices
 
-## Factory — modeling choices
+- Max-flow with lower bounds (transformation)
 
-- Item balances / conservation (for each item i):
+  - Convert lo≤f≤hi to capacities hi-lo; track node imbalances: imbalance[u]-=lo, imbalance[v]+=lo.
+  - Solve circulation/feasibility then reconstruct f = f' + lo.
 
-  $$\sum_{r} \mathrm{out}_{r,i}\,(1+\mathrm{prod}_{m_r})\,x_r - \sum_{r} \mathrm{in}_{r,i}\,x_r = b_i$$
+- Order of operations
 
-  - Decision vars: $x_r$ = crafts/min for recipe $r$.
-  - $b_{\text{target}}$ = target rate (equality), intermediate items: $b_i=0$, byproducts: $b_i\ge0$, raw items: $b_i\le0$ with supply caps.
+  1. Node-splitting for node capacity constraints
+  2. Lower-bound transform (imbalance calculation)
+  3. Feasibility check via auxiliary super-source/sink (s* / t*)
+  4. Main flow computation (virtual source → sink)
+  5. Reconstruct original flows
 
-- Raw consumption constraints:
+- Node-splitting for capacity constraints
 
-  $$\text{net\_production}_i \le 0 \qquad\text{and}\qquad -\text{net\_production}_i \le \text{supply\_cap}_i$$
+  - Replace node v with v_in → v_out edge of capacity cap[v]; redirect incoming → v_in and outgoing from v_out. Do not split sources/sink.
 
-- Machine capacity (per machine type $m$):
+- Feasibility check strategy
 
-  $$\sum_{r\in M} \frac{x_r}{\text{eff\_crafts\_per\_min}(r)} \le \text{max\_machines}_m$$
+  - Build s*/t* with edges for node demands/supplies and run max-flow; if all demands satisfied, lower bounds feasible; else report infeasible early.
 
-  with
+- Infeasibility certificates (min-cut)
+  - After max-flow, find reachable set in residual graph (BFS on residual edges with capacity > ε). Certificate includes cut_reachable, demand_balance (unsatisfied flow), tight_nodes (nodes at cap), and tight_edges crossing the cut.
 
-  $$\text{eff\_crafts\_per\_min}(r)=\text{base\_speed}\,(1+\text{speed\_mult})\,\frac{60}{\text{time}_r}$$
+--- 
 
-- Module effects (per-machine-type): speed multiplies craft rate; productivity multiplies outputs only:
+## Numeric approach and solver choices
 
-  $$\text{effective\_output}=\text{base\_output}\,(1+\text{prod\_mult})$$
+- Tolerances
 
-- Cycles / byproducts / self-contained recipes: handled by conservation equations (set $b_i=0$ for cyclic intermediates). Byproducts allowed via inequality ($b_i\ge0$) so surplus accumulates but does not block feasible runs.
+  - Use tight tolerances to avoid floating-point artifacts (example ε = 1e-9 for conservation and capacity checks).
 
-- Tie-breaking / determinism: primary objective is meet target; secondary minimize total machines (minimize $\sum_r x_r/\text{eff}_r$). Determinism via sorted iteration, fixed solver seed and single-threaded solve.
+- Solvers / algorithms
 
-- Infeasibility detection & max-rate search: prefer LP infeasibility detection (CBC Simplex). If infeasible, binary search on target rate:
+  - Factory: LP (PuLP + CBC) using simplex (deterministic with fixed seed). Chosen for natural formulation, correctness, and built-in infeasibility detection.
+  - Belts: Hand-implemented deterministic Edmonds–Karp (BFS). Chosen for clarity, determinism, and sufficient performance.
 
-  - iterate: set mid=(low+high)/2; solve LP with target=mid; move low/high accordingly until desired precision.
+- Tie-breaking for determinism
+  - Sort nodes, edges, recipes lexicographically when iterating and building constraints or BFS neighbor lists. Use fixed solver options and single-threading to get bit-identical outputs.
 
-## Belts — modeling choices
+--- 
 
-- Max-flow with lower bounds: transform to circulation problem:
+## Failure modes & edge cases (what to watch for)
 
-  1. Set capacities: $c'_e = h_e - l_e$.
-  2. Track node imbalances: for edge $u\to v$, subtract $l_e$ from $d_u$ and add $l_e$ to $d_v$.
-  3. Solve feasibility (circulation) on modified capacities; reconstruct flow as $f_e = f'_e + l_e$.
+- Factory
 
-- Node-splitting for node capacity $C_v$: replace $v$ with $v_{in}\to v_{out}$ and add edge $v_{in}\to v_{out}$ with capacity $C_v$; redirect incoming to $v_{in}$ and outgoing from $v_{out}$.
+  - Cycles in recipes: handled by b=0 balances; LP finds steady-state flows or zero rates if non-beneficial.
+  - Infeasible raw supply or machine counts: LP reports infeasible; binary search finds max feasible target and bottleneck hints.
+  - Degenerate / redundant recipes: LP sets non-useful recipes to zero; objective minimizes machines so efficient recipes preferred; tie-break via lexicographic order.
 
-- Feasibility check strategy (two-phase):
+- Belts
+  - Disconnected components: flow from unreachable sources is zero; min-cut shows disconnected supplies.
+  - Unsatisfiable lower bounds or node-cap conflicts: detected in Phase 1 feasibility check; report deficit and certificate indicating bottleneck nodes/edges.
 
-  1. Phase 1 — circulation feasibility: add super-source/sink connecting according to imbalances and run max-flow; if demands unsatisfied → infeasible.
-  2. Phase 2 — main flow: connect actual sources to virtual source and run max-flow to sink; check supply satisfied.
+--- 
 
-- Infeasibility certificates (min-cut): after max-flow, compute reachable set in residual graph; report
+## Minimal implementation & testing notes
 
-  - `cut_reachable` (S side),
-  - `demand_balance` = total_supply − achieved_flow,
-  - `tight_nodes` (nodes at capacity),
-  - `tight_edges` (saturated edges crossing the cut).
+- Factory: `factory/main.py` (LP with PuLP + CBC). Keep deterministic seed and sort inputs.
+- Belts: `belts/main.py` (Edmonds–Karp + transforms). Use sorted neighbor lists.
+- Tests: check conservation, capacity, and deterministic outputs; when infeasible, validate returned max_feasible_target_per_min and certificate fields.
 
-## Numeric approach
+---
 
-- Tolerances: use tight epsilons to avoid floating errors, e.g. $\varepsilon=10^{-9}$ for conservation, capacity checks and cut saturation tests.
-
-- Solver choices & rationale:
-
-  - Factory: LP (PuLP + CBC) — natural, handles cycles/byproducts, reliable infeasibility detection and fast for intended sizes.
-  - Belts: hand-implemented Edmonds–Karp (BFS) — deterministic, simple, no external deps; lower-bound transforms done prior to flow.
-
-- Tie-breaking for determinism: sort keys (recipes, items, graph neighbors), fixed solver options, single-threaded execution; ensures identical outputs for same input.
-
-## Failure modes & edge cases (brief)
-
-- Cycles in recipes: set $b_i=0$ for intermediates; LP finds steady-state flows or sets rates to zero if unhelpful.
-
-- Infeasible raw supplies or machine counts: LP returns infeasible; use binary search to find max feasible target and provide bottleneck hints (raw supply or machine caps).
-
-- Degenerate or redundant recipes: LP objective (min machines) drives unused/inefficient recipes to zero; ties broken lexicographically.
-
-- Disconnected belt components: max-flow yields zero flow for unreachable components; min-cut certificate identifies unreachable sources/edges.
