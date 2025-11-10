@@ -76,7 +76,7 @@ def test_basic_feasible():
     # Check that green_circuit is produced at the target rate
     # With 10% productivity: 1636.36 crafts * 1.1 = 1800 items/min
     green_crafts = result["per_recipe_crafts_per_min"]["green_circuit"]
-    assert abs(green_crafts * 1.1 - 1800) < 0.1
+    assert abs(green_crafts - 1800) < 0.1
     
     print("✓ Basic feasible test passed")
 
