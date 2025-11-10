@@ -1,0 +1,8 @@
+Name: Vraj Tamakuwala
+Email: tamakuwala_vs@cs.iitr.ac.in
+
+# System information collected on 2025-11-10
+OS: Microsoft Windows 11 Home Single Language (Version 10.0.26200)
+CPU: AMD Ryzen 5 5500U with Radeon Graphics (6 cores, 12 logical processors)
+RAM: 16456007680 bytes (~16.46 GB / ~15.33 GiB)
+Language: Python 3.11.9
